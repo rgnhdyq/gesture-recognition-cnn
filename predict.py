@@ -1,11 +1,10 @@
 """
 手势识别实时预测脚本
-使用摄像头 + MediaPipe + CNN
+支持手部区域自动检测
 """
 
 import os
 import cv2
-import mediapipe as mp
 import numpy as np
 from PIL import Image
 import torch
@@ -18,46 +17,66 @@ NUM_CLASSES = 10
 IMG_SIZE = 64
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# ============== 手部检测 ==============
+def detect_hand(frame):
+    """检测手部区域，返回 (x, y, w, h) 或 None"""
+    
+    # 方法1: 肤色检测 + 轮廓分析
+    def skin_detect(img):
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        
+        # 肤色范围
+        lower = np.array([0, 20, 70], dtype=np.uint8)
+        upper = np.array([20, 255, 255], dtype=np.uint8)
+        mask = cv2.inRange(hsv, lower, upper)
+        
+        # 去除噪声
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        mask = cv2.erode(mask, kernel, iterations=2)
+        mask = cv2.dilate(mask, kernel, iterations=2)
+        
+        # 高斯模糊
+        mask = cv2.GaussianBlur(mask, (3, 3), 0)
+        
+        return mask
+    
+    mask = skin_detect(frame)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if contours:
+        # 找最大轮廓
+        max_contour = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(max_contour)
+        
+        # 过滤小区域
+        if area > 5000:
+            x, y, w, h = cv2.boundingRect(max_contour)
+            # 确保区域合理
+            if w > 30 and h > 30 and w < frame.shape[1] * 0.9 and h < frame.shape[0] * 0.9:
+                return (x, y, w, h)
+    
+    return None
+
+
 # ============== CNN 模型 ==============
 class GestureCNN(nn.Module):
     def __init__(self, num_classes=10):
-        super(GestureCNN, self).__init__()
-        
+        super().__init__()
         self.features = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-            
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-            
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-            
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
+            nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(128, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(), nn.MaxPool2d(2),
         )
-        
         self.classifier = nn.Sequential(
             nn.Flatten(),
             nn.Dropout(0.5),
-            nn.Linear(256 * 4 * 4, 512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
+            nn.Linear(256 * 4 * 4, 512), nn.ReLU(), nn.Dropout(0.3),
             nn.Linear(512, num_classes)
         )
     
     def forward(self, x):
-        x = self.features(x)
-        x = self.classifier(x)
-        return x
+        return self.classifier(self.features(x))
 
 
 # ============== 预测器 ==============
@@ -68,148 +87,106 @@ class GesturePredictor:
         if os.path.exists(model_path):
             self.model.load_state_dict(torch.load(model_path, map_location=DEVICE))
             self.model.eval()
-            print(f"✓ 模型加载成功: {model_path}")
+            print(f"✓ 模型加载成功")
         else:
-            print(f"✗ 模型文件不存在: {model_path}")
-            print("请先运行 train.py collect 采集数据，再运行 train.py train 训练模型")
+            print(f"✗ 模型不存在: {model_path}")
             return
         
         self.transform = transforms.Compose([
             transforms.Resize((IMG_SIZE, IMG_SIZE)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                               std=[0.229, 0.224, 0.225])
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
         
-        # MediaPipe
-        self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=1,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.5
-        )
-        self.mp_draw = mp.solutions.drawing_utils
-        
-        # 预测结果平滑
         self.predictions = []
-        self.smoothing_window = 5
+        self.window = 5
     
     def predict(self, hand_img):
-        """预测单张手势图像"""
         img = Image.fromarray(cv2.cvtColor(hand_img, cv2.COLOR_BGR2RGB))
         img = self.transform(img).unsqueeze(0).to(DEVICE)
         
         with torch.no_grad():
-            outputs = self.model(img)
-            probs = torch.softmax(outputs, dim=1)
-            confidence, predicted = torch.max(probs, 1)
+            out = self.model(img)
+            prob = torch.softmax(out, dim=1)
+            conf, pred = torch.max(prob, 1)
         
-        return predicted.item(), confidence.item(), probs.cpu().numpy()[0]
+        return pred.item(), conf.item()
     
-    def smooth_predict(self, pred, conf):
-        """平滑预测结果"""
+    def smooth(self, pred, conf):
         self.predictions.append((pred, conf))
-        if len(self.predictions) > self.smoothing_window:
+        if len(self.predictions) > self.window:
             self.predictions.pop(0)
         
-        # 取最常见的预测
         from collections import Counter
-        preds = [p[0] for p in self.predictions]
-        most_common = Counter(preds).most_common(1)[0][0]
-        
-        # 取平均置信度
+        most_common = Counter([p[0] for p in self.predictions]).most_common(1)[0][0]
         avg_conf = sum([p[1] for p in self.predictions]) / len(self.predictions)
-        
         return most_common, avg_conf
     
     def run(self):
-        """运行实时预测"""
         cap = cv2.VideoCapture(0)
-        
         if not cap.isOpened():
             print("无法打开摄像头！")
             return
         
-        print("\n手势识别实时预测")
-        print("按 'q' 退出")
-        print("按 'r' 重置预测历史")
-        print("-" * 40)
-        
-        current_gesture = None
-        current_confidence = 0
+        print("\n手势识别 - 手放到画面任意位置 - 按 Q 退出\n")
         
         while True:
             ret, frame = cap.read()
             if not ret:
-                print("无法读取摄像头画面")
                 break
             
-            # 镜像
             frame = cv2.flip(frame, 1)
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = self.hands.process(rgb_frame)
+            display = frame.copy()
             
-            gesture_text = "未检测到手"
+            # 检测手部
+            roi = detect_hand(frame)
             
-            if results.multi_hand_landmarks:
-                for hand_landmarks in results.multi_hand_landmarks:
-                    # 绘制关键点
-                    self.mp_draw.draw_landmarks(
-                        frame, hand_landmarks, 
-                        self.mp_hands.HAND_CONNECTIONS
-                    )
-                    
-                    # 裁剪手部区域
-                    h, w, _ = frame.shape
-                    x_min = int(min([lm.x for lm in hand_landmarks.landmark]) * w) - 20
-                    x_max = int(max([lm.x for lm in hand_landmarks.landmark]) * w) + 20
-                    y_min = int(min([lm.y for lm in hand_landmarks.landmark]) * h) - 20
-                    y_max = int(max([lm.y for lm in hand_landmarks.landmark]) * h) + 20
-                    
-                    x_min, x_max = max(0, x_min), min(w, x_max)
-                    y_min, y_max = max(0, y_min), min(h, y_max)
-                    
-                    if x_max > x_min and y_max > y_min:
-                        hand_img = frame[y_min:y_max, x_min:x_max]
-                        
-                        if hand_img.size > 0:
-                            pred, conf = self.predict(hand_img)
-                            pred, conf = self.smooth_predict(pred, conf)
-                            
-                            current_gesture = pred
-                            current_confidence = conf
-                            
-                            gesture_text = f"手势: {pred} ({conf*100:.1f}%)"
+            gesture_text = "将手放入画面"
+            conf = 0
+            
+            if roi:
+                x, y, w, h = roi
+                
+                # 扩大一点区域
+                margin = 10
+                x, y = max(0, x - margin), max(0, y - margin)
+                w, h = min(frame.shape[1] - x, w + 2*margin), min(frame.shape[0] - y, h + 2*margin)
+                
+                # 画框
+                cv2.rectangle(display, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                
+                # 裁剪手部区域
+                hand = frame[y:y+h, x:x+w]
+                if hand.size > 0:
+                    pred, conf = self.predict(hand)
+                    pred, conf = self.smooth(pred, conf)
+                    gesture_text = f"手势: {pred} ({conf*100:.1f}%)"
+            else:
+                # 没检测到时显示提示
+                cv2.putText(display, "将手放入画面中...", (display.shape[1]//2 - 100, display.shape[0]//2),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             
             # 显示结果
-            cv2.putText(frame, gesture_text, (10, 40),
+            cv2.putText(display, gesture_text, (10, 40),
                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2)
             
-            # 显示置信度条
-            if current_gesture is not None:
-                bar_width = int(200 * current_confidence)
-                cv2.rectangle(frame, (10, 60), (10 + bar_width, 80), (0, 255, 0), -1)
-                cv2.rectangle(frame, (10, 60), (210, 80), (255, 255, 255), 2)
+            if conf > 0:
+                bar_w = int(200 * conf)
+                cv2.rectangle(display, (10, 60), (10+bar_w, 80), (0, 255, 0), -1)
+                cv2.rectangle(display, (10, 60), (210, 80), (255, 255, 255), 2)
             
-            # 显示手势 0-9
-            cv2.putText(frame, "0  1  2  3  4  5  6  7  8  9",
-                       (10, frame.shape[0] - 20),
+            cv2.putText(display, "0  1  2  3  4  5  6  7  8  9",
+                       (10, display.shape[0]-20),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
             
-            cv2.imshow("Gesture Recognition", frame)
+            cv2.imshow("Gesture Recognition", display)
             
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
+            if cv2.waitKey(100) & 0xFF == ord('q'):
                 break
-            elif key == ord('r'):
-                self.predictions = []
-                current_gesture = None
         
         cap.release()
         cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
-    predictor = GesturePredictor(MODEL_PATH)
-    predictor.run()
+    GesturePredictor(MODEL_PATH).run()
