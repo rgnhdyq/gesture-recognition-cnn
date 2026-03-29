@@ -1,6 +1,6 @@
 """
 手势识别训练脚本
-手势数字 0-9
+支持肤色检测 + 人脸排除
 """
 
 import os
@@ -29,7 +29,106 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 cv2.namedWindow('Camera', cv2.WINDOW_NORMAL)
 cv2.namedWindow('Preview', cv2.WINDOW_NORMAL)
 
+# ============== 人脸检测器 ==============
+face_cascade = None
+try:
+    face_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+    )
+    print("✓ 人脸检测器加载成功")
+except:
+    print("✗ 人脸检测器加载失败")
+
 print("按 Q 退出，按 SPACE 保存当前画面")
+
+
+# ============== 手部检测 ==============
+def detect_hand(frame):
+    """检测手部区域，排除人脸"""
+    
+    def skin_mask(img):
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        
+        lower1 = np.array([0, 20, 70], dtype=np.uint8)
+        upper1 = np.array([20, 255, 255], dtype=np.uint8)
+        mask1 = cv2.inRange(hsv, lower1, upper1)
+        
+        lower2 = np.array([165, 20, 70], dtype=np.uint8)
+        upper2 = np.array([180, 255, 255], dtype=np.uint8)
+        mask2 = cv2.inRange(hsv, lower2, upper2)
+        
+        mask = cv2.bitwise_or(mask1, mask2)
+        
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.erode(mask, kernel, iterations=2)
+        mask = cv2.dilate(mask, kernel, iterations=2)
+        mask = cv2.GaussianBlur(mask, (3, 3), 0)
+        
+        return mask
+    
+    # 人脸区域
+    face_rects = []
+    if face_cascade:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+        for (fx, fy, fw, fh) in faces:
+            margin = 30
+            fx2 = max(0, fx - margin)
+            fy2 = max(0, fy - margin)
+            fx2_end = min(frame.shape[1], fx + fw + margin)
+            fy2_end = min(frame.shape[0], fy + fh + margin + 50)
+            face_rects.append((fx2, fy2, fx2_end - fx2, fy2_end - fy2))
+    
+    mask = skin_mask(frame)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        return None
+    
+    best_contour = None
+    best_area = 0
+    
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < 3000 or area > frame.shape[0] * frame.shape[1] * 0.7:
+            continue
+        
+        x, y, w, h = cv2.boundingRect(contour)
+        
+        # 检查是否与人脸重叠
+        is_face = False
+        for (fx, fy, fw, fh) in face_rects:
+            overlap_x = max(x, fx)
+            overlap_y = max(y, fy)
+            overlap_x_end = min(x + w, fx + fw)
+            overlap_y_end = min(y + h, fy + fh)
+            
+            if overlap_x < overlap_x_end and overlap_y < overlap_y_end:
+                overlap_area = (overlap_x_end - overlap_x) * (overlap_y_end - overlap_y)
+                overlap_ratio = overlap_area / (w * h)
+                if overlap_ratio > 0.3:
+                    is_face = True
+                    break
+        
+        if is_face:
+            continue
+        
+        if area > best_area:
+            best_area = area
+            best_contour = contour
+    
+    if best_contour is None:
+        return None
+    
+    x, y, w, h = cv2.boundingRect(best_contour)
+    
+    margin = 10
+    x = max(0, x - margin)
+    y = max(0, y - margin)
+    w = min(frame.shape[1] - x, w + 2 * margin)
+    h = min(frame.shape[0] - y, h + 2 * margin)
+    
+    return (x, y, w, h)
 
 
 def collect_data(label, num_samples=100):
@@ -50,31 +149,43 @@ def collect_data(label, num_samples=100):
             break
         
         frame = cv2.flip(frame, 1)
-        
-        # 中心区域作为默认手部区域
-        h, w = frame.shape[:2]
-        cx, cy = w // 2, h // 2
-        size = min(w, h) // 3
-        x, y = cx - size//2, cy - size//2
-        
-        # 画框
         display = frame.copy()
-        cv2.rectangle(display, (x, y), (x+size, y+size), (0, 255, 0), 2)
+        
+        # 检测手部
+        roi = detect_hand(frame)
+        
+        if roi:
+            x, y, w, h = roi
+            cv2.rectangle(display, (x, y), (x+w, y+h), (0, 255, 0), 2)
+            hand_img = frame[y:y+h, x:x+w]
+            cv2.imshow('Preview', cv2.resize(hand_img, (300, 300)))
+        else:
+            # 默认中心区域
+            h, w = frame.shape[:2]
+            cx, cy = w // 2, h // 2
+            size = min(w, h) // 3
+            x, y = cx - size//2, cy - size//2
+        
         cv2.putText(display, f"Gesture {label}: {collected}/{num_samples}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         cv2.putText(display, "SPACE=save", (10, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
         
         cv2.imshow('Camera', display)
-        cv2.imshow('Preview', cv2.resize(frame[y:y+size, x:x+size], (300, 300)))
         
-        # 处理按键事件
-        key = cv2.waitKey(100) & 0xFF  # 100ms 超时，避免完全卡死
-        
-        if key == ord('q') or key == ord('Q'):
+        if cv2.waitKey(100) & 0xFF == ord('q'):
             break
-        elif key == ord(' '):
-            hand_img = frame[y:y+size, x:x+size]
+        elif cv2.waitKey(100) & 0xFF == ord(' '):
+            if roi:
+                x, y, w, h = roi
+            else:
+                h, w = frame.shape[:2]
+                cx, cy = w // 2, h // 2
+                size = min(w, h) // 3
+                x, y = cx - size//2, cy - size//2
+                print("使用中心区域（未检测到手）")
+            
+            hand_img = frame[y:y+h, x:x+w]
             hand_img = cv2.resize(hand_img, (IMG_SIZE, IMG_SIZE))
             cv2.imwrite(os.path.join(label_dir, f"{int(time.time()*1000)}.jpg"), hand_img)
             collected += 1
@@ -91,6 +202,7 @@ def auto_collect_all():
         print(f"\n{'='*50}")
         print(f"手势 {i} - 按 SPACE 保存，按 Q 退出")
         print(f"{'='*50}")
+        input("按回车开始...")
         collect_data(i, num_samples=150)
 
 
@@ -227,7 +339,7 @@ if __name__ == "__main__":
         print("用法:")
         print("  python train.py collect     - 采集所有手势")
         print("  python train.py collect 5   - 采集手势 5")
-        print("  python train.py train       - 训练模型")
+        print("  python train.py train      - 训练模型")
         sys.exit(1)
     
     cmd = sys.argv[1]

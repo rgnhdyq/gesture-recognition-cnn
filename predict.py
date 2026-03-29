@@ -1,6 +1,6 @@
 """
 手势识别实时预测脚本
-支持手部区域自动检测
+肤色检测 + 人脸排除
 """
 
 import os
@@ -17,45 +17,110 @@ NUM_CLASSES = 10
 IMG_SIZE = 64
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# ============== 加载人脸检测器 ==============
+face_cascade = None
+try:
+    face_cascade = cv2.CascadeClassifier(
+        cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+    )
+    print("✓ 人脸检测器加载成功")
+except:
+    print("✗ 人脸检测器加载失败")
+
 # ============== 手部检测 ==============
 def detect_hand(frame):
-    """检测手部区域，返回 (x, y, w, h) 或 None"""
+    """检测手部区域，排除人脸"""
     
-    # 方法1: 肤色检测 + 轮廓分析
-    def skin_detect(img):
+    def skin_mask(img):
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         
         # 肤色范围
-        lower = np.array([0, 20, 70], dtype=np.uint8)
-        upper = np.array([20, 255, 255], dtype=np.uint8)
-        mask = cv2.inRange(hsv, lower, upper)
+        lower1 = np.array([0, 20, 70], dtype=np.uint8)
+        upper1 = np.array([20, 255, 255], dtype=np.uint8)
+        mask1 = cv2.inRange(hsv, lower1, upper1)
         
-        # 去除噪声
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        lower2 = np.array([165, 20, 70], dtype=np.uint8)
+        upper2 = np.array([180, 255, 255], dtype=np.uint8)
+        mask2 = cv2.inRange(hsv, lower2, upper2)
+        
+        mask = cv2.bitwise_or(mask1, mask2)
+        
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         mask = cv2.erode(mask, kernel, iterations=2)
         mask = cv2.dilate(mask, kernel, iterations=2)
-        
-        # 高斯模糊
         mask = cv2.GaussianBlur(mask, (3, 3), 0)
         
         return mask
     
-    mask = skin_detect(frame)
+    mask = skin_mask(frame)
+    
+    # 人脸区域 - 需要排除
+    face_rects = []
+    if face_cascade:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+        for (fx, fy, fw, fh) in faces:
+            # 扩展人脸区域（脖子、肩膀也要排除）
+            margin = 30
+            fx2 = max(0, fx - margin)
+            fy2 = max(0, fy - margin)
+            fx2_end = min(frame.shape[1], fx + fw + margin)
+            fy2_end = min(frame.shape[0], fy + fh + margin + 50)  # 往下扩展
+            face_rects.append((fx2, fy2, fx2_end - fx2, fy2_end - fy2))
+    
+    # 找轮廓
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    if contours:
-        # 找最大轮廓
-        max_contour = max(contours, key=cv2.contourArea)
-        area = cv2.contourArea(max_contour)
-        
-        # 过滤小区域
-        if area > 5000:
-            x, y, w, h = cv2.boundingRect(max_contour)
-            # 确保区域合理
-            if w > 30 and h > 30 and w < frame.shape[1] * 0.9 and h < frame.shape[0] * 0.9:
-                return (x, y, w, h)
+    if not contours:
+        return None
     
-    return None
+    # 过滤掉人脸区域
+    best_contour = None
+    best_area = 0
+    
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < 3000 or area > frame.shape[0] * frame.shape[1] * 0.7:
+            continue
+        
+        x, y, w, h = cv2.boundingRect(contour)
+        
+        # 检查是否与人脸重叠
+        is_face = False
+        for (fx, fy, fw, fh) in face_rects:
+            # 计算重叠
+            overlap_x = max(x, fx)
+            overlap_y = max(y, fy)
+            overlap_x_end = min(x + w, fx + fw)
+            overlap_y_end = min(y + h, fy + fh)
+            
+            if overlap_x < overlap_x_end and overlap_y < overlap_y_end:
+                overlap_area = (overlap_x_end - overlap_x) * (overlap_y_end - overlap_y)
+                overlap_ratio = overlap_area / (w * h)
+                if overlap_ratio > 0.3:  # 30%以上重叠认为是人脸
+                    is_face = True
+                    break
+        
+        if is_face:
+            continue
+        
+        if area > best_area:
+            best_area = area
+            best_contour = contour
+    
+    if best_contour is None:
+        return None
+    
+    x, y, w, h = cv2.boundingRect(best_contour)
+    
+    # 扩展边界
+    margin = 10
+    x = max(0, x - margin)
+    y = max(0, y - margin)
+    w = min(frame.shape[1] - x, w + 2 * margin)
+    h = min(frame.shape[0] - y, h + 2 * margin)
+    
+    return (x, y, w, h)
 
 
 # ============== CNN 模型 ==============
@@ -100,6 +165,7 @@ class GesturePredictor:
         
         self.predictions = []
         self.window = 5
+        self.last_roi = None
     
     def predict(self, hand_img):
         img = Image.fromarray(cv2.cvtColor(hand_img, cv2.COLOR_BGR2RGB))
@@ -128,7 +194,7 @@ class GesturePredictor:
             print("无法打开摄像头！")
             return
         
-        print("\n手势识别 - 手放到画面任意位置 - 按 Q 退出\n")
+        print("\n手势识别 - 按 Q 退出\n")
         
         while True:
             ret, frame = cap.read()
@@ -138,35 +204,27 @@ class GesturePredictor:
             frame = cv2.flip(frame, 1)
             display = frame.copy()
             
-            # 检测手部
             roi = detect_hand(frame)
+            
+            if roi is None and self.last_roi is not None:
+                roi = self.last_roi
             
             gesture_text = "将手放入画面"
             conf = 0
             
             if roi:
                 x, y, w, h = roi
-                
-                # 扩大一点区域
-                margin = 10
-                x, y = max(0, x - margin), max(0, y - margin)
-                w, h = min(frame.shape[1] - x, w + 2*margin), min(frame.shape[0] - y, h + 2*margin)
-                
-                # 画框
                 cv2.rectangle(display, (x, y), (x+w, y+h), (0, 255, 0), 2)
                 
-                # 裁剪手部区域
                 hand = frame[y:y+h, x:x+w]
-                if hand.size > 0:
+                if hand.size > 0 and w > 20 and h > 20:
                     pred, conf = self.predict(hand)
                     pred, conf = self.smooth(pred, conf)
                     gesture_text = f"手势: {pred} ({conf*100:.1f}%)"
+                    self.last_roi = roi
             else:
-                # 没检测到时显示提示
-                cv2.putText(display, "将手放入画面中...", (display.shape[1]//2 - 100, display.shape[0]//2),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                self.last_roi = None
             
-            # 显示结果
             cv2.putText(display, gesture_text, (10, 40),
                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2)
             
