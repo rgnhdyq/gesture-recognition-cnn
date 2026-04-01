@@ -1,0 +1,23 @@
+# 数据
+gesture_data/
+gesture_data_skeleton/
+
+# 模型 (太大)
+*.pth
+
+# 媒体
+*.jpg
+*.png
+*.npy
+
+# MediaPipe 模型
+hand_landmarker.task
+
+# IDE
+.idea/
+__pycache__/
+*.pyc
+
+# 系统
+.git-credentials
+.DS_Store

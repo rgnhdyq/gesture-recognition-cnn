@@ -1,125 +1,98 @@
-# 手势识别 - 深度学习项目
+# Gesture Recognition - MediaPipe v2
 
-基于 CNN 的手势数字识别（0-9），使用 MediaPipe 进行手部检测。
+基于 MediaPipe Hands 的手势数字识别（0-9），使用关键点几何特征 + MLP 神经网络。
 
 ## 项目结构
 
 ```
 GR/
-├── requirements.txt    # 依赖包
-├── train.py          # 训练脚本（数据采集 + 模型训练）
-├── predict.py        # 实时预测脚本
-├── best_model.pth    # 训练好的模型（训练后生成）
-├── gesture_data/     # 手势数据目录（采集后生成）
-│   ├── 0/            # 数字0的手势
-│   ├── 1/
-│   ├── ...
-│   └── 9/
+├── requirements.txt              # 依赖
+├── train_mediapipe_v2.py        # 训练脚本 (数据采集 + 训练)
+├── predict_mediapipe_v2.py      # 实时预测脚本
+├── predict_mediapipe.py         # 中间版本
+├── train_mediapipe.py           # 中间版本
+├── predict.py                   # 旧版 (CNN 图像方案)
+├── train.py                      # 旧版 (CNN 图像方案)
+├── best_model_v2.pth            # 训练好的模型 (v2, 不上传)
+├── best_model.pth               # 旧版模型 (不上传)
+├── gesture_data/                # 旧版图像数据 (不上传)
+├── gesture_data_skeleton/       # 骨架关键点数据 (不上传)
+├── hand_landmarker.task         # MediaPipe 模型 (不上传)
 └── README.md
 ```
 
 ## 环境配置
 
 ```bash
-# 1. 创建 conda 环境（推荐）
-conda create -n gesture python=3.9
-conda activate gesture
-
-# 2. 安装 PyTorch（根据你的 CUDA 版本）
-# CUDA 11.8
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-
-# CUDA 12.1
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-
-# CPU only
-pip install torch torchvision
-
-# 3. 安装其他依赖
-pip install -r requirements.txt
+pip install opencv-python numpy torch torchvision mediapipe scikit-learn tqdm pillow
 ```
 
-## 使用步骤
+## 使用方法
 
 ### 1. 数据采集
 
 ```bash
 # 采集所有手势 0-9
-python train.py collect
+python train_mediapipe_v2.py collect
 
-# 或者采集单个手势（测试用）
-python train.py collect 5  # 只采集数字5
+# 采集单个手势
+python train_mediapipe_v2.py collect 5
 ```
 
-**采集说明：**
-- 按空格键保存图片
-- 按 `q` 跳过当前手势
-- 建议采集 100-200 张/手势
-- 确保光线充足，手部清晰
+- 按空格键保存样本
+- 按 `q` 退出
+- 建议采集 150 张/手势
 
 ### 2. 训练模型
 
 ```bash
-python train.py train
+python train_mediapipe_v2.py train
 ```
-
-训练完成后：
-- 最佳模型保存为 `best_model.pth`
-- 验证准确率会在终端显示
 
 ### 3. 实时预测
 
 ```bash
-python predict.py
+python predict_mediapipe_v2.py [模型路径] [特征维度]
+# 例如
+python predict_mediapipe_v2.py best_model_v2.pth 84
 ```
 
-**操作说明：**
-- 按 `q` 退出
-- 按 `r` 重置预测历史
-- 确保摄像头正常工作
+## 特征工程 (v2)
 
-## 模型架构
+输入特征 **84 维**：
+
+| 特征类型 | 维度 | 说明 |
+|---------|------|------|
+| 归一化坐标 | 63 | 21 关键点 × 3 (x, y, z)，以掌心为原点 |
+| 指尖-掌心距离 | 5 | 5 个指尖到掌心的欧氏距离 |
+| 指尖间距离 | 10 | C(5,2) 两两指尖距离 |
+| 指节角度 | 8 | 4 个手指链 × 2 个角度 (cos 值) |
+| 手掌宽/高 | 2 | 手掌宽度和高度 |
+
+## 模型架构 (v2)
 
 ```
-GestureCNN
-├── Conv2d(3, 32) + BN + ReLU + MaxPool
-├── Conv2d(32, 64) + BN + ReLU + MaxPool
-├── Conv2d(64, 128) + BN + ReLU + MaxPool
-├── Conv2d(128, 256) + BN + ReLU + MaxPool
-├── Flatten
-├── Dropout(0.5)
-├── Linear(4096, 512) + ReLU + Dropout(0.3)
-└── Linear(512, 10)
+GestureMLP (84 → 10)
+├── Linear(84, 256) + BN + ReLU + Dropout(0.3)
+├── Linear(256, 512) + BN + ReLU + Dropout(0.3)
+├── Linear(512, 256) + BN + ReLU + Dropout(0.2)
+├── Linear(256, 128) + ReLU + Dropout(0.1)
+└── Linear(128, 10)
 ```
 
 ## 数据增强
 
-训练时使用以下增强：
-- 随机旋转 (±15°)
-- 随机水平翻转
-- 颜色抖动 (亮度±20%, 对比度±20%)
+- 随机缩放 (0.9 ~ 1.1)
+- 坐标噪声 (σ=0.01)
+- 几何特征噪声 (σ=0.03)
 
-## 常见问题
+## 版本历史
 
-### Q: 摄像头无法打开？
-```python
-# 修改 predict.py 中的摄像头索引
-cap = cv2.VideoCapture(1)  # 尝试索引 1, 2...
-```
+- **v2**: MediaPipe 关键点 + 几何特征 + MLP (当前版本)
+- **v1**: MediaPipe 关键点 (过渡版本)
+- **原始版**: CNN + 肤色检测 + 人脸排除
 
-### Q: 训练时显存不足？
-```python
-# 减小 batch size（train.py 中修改）
-BATCH_SIZE = 16  # 原来 32
-```
-
-### Q: 模型预测不准？
-- 增加训练数据量
-- 确保采集时手势多样性（不同角度、距离）
-- 调整 MediaPipe 的 `min_detection_confidence`
-
-## 参考资料
+## 参考
 
 - [MediaPipe Hands](https://google.github.io/mediapipe/solutions/hands)
-- [PyTorch Tutorials](https://pytorch.org/tutorials/)
-- [LeNet-5 Architecture](http://yann.lecun.com/exdb/lenet/)
+- [PyTorch](https://pytorch.org/)
